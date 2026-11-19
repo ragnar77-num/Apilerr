@@ -1,12 +1,15 @@
 <?php
 /* ============================================================
- *  CC CHECKER API — Single File
+ *  CC CHECKER API — Single File (No .htaccess)
+ *  URL    : /?maxipuan?cc=...
+ *           /?stripeauth?cc=...
+ *           /?bonuspuan?cc=...
+ *           /?1charge?cc=...
  *  Format : kart|ay|yil|cvv | Declined/Approved | Response
  *  Yıl    : 2 hane (28) veya 4 hane (2028) kabul → 2 haneye normalize
  *  Oran   : %15 Approved / %85 Declined
  *  Tutar  : Sadece maxipuan & bonuspuan (0.00 – 3560.00)
  *  Prefix : Sadece 4, 5, 6, 9 geçerli
- *  Platform: InfinityFree / PHP 7.4+
  * ============================================================ */
 
 header('Content-Type: application/json; charset=utf-8');
@@ -48,17 +51,7 @@ $GATEWAYS = [
 ];
 
 // ------------------------------------------------------------
-// 2) ROUTES
-// ------------------------------------------------------------
-$ROUTES = [
-    '/api/v1/maxipuan'   => 'maxipuan',
-    '/api/v1/stripeauth' => 'stripeauth',
-    '/api/v1/bonuspuan'  => 'bonuspuan',
-    '/api/v1/1charge'    => '1charge',
-];
-
-// ------------------------------------------------------------
-// 3) HELPERS
+// 2) HELPERS
 // ------------------------------------------------------------
 
 function jsonOut(int $code, array $data): void {
@@ -95,35 +88,30 @@ function parseCard(string $cc): array {
 
     [$card, $month, $year, $cvv] = array_map('trim', $parts);
 
-    // 1) 16 hane rakam
     if (!preg_match('/^\d{16}$/', $card)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // 2) Sadece 4, 5, 6, 9 ile başlayanlar geçerli
     $first = $card[0];
     if (!in_array($first, ['4', '5', '6', '9'], true)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // 3) Ay 01-12
     if (!preg_match('/^(0[1-9]|1[0-2])$/', $month)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // 4) Yıl: 2 hane (28) veya 4 hane (2028) kabul → 2 haneye normalize
+    // Yıl: 2 hane veya 4 hane kabul → 2 haneye normalize
     if (preg_match('/^\d{4}$/', $year)) {
-        $year = substr($year, -2); // 2028 → 28
+        $year = substr($year, -2);
     } elseif (!preg_match('/^\d{2}$/', $year)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // 5) CVV 3-4 hane
     if (!preg_match('/^\d{3,4}$/', $cvv)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // 6) Luhn
     if (!luhnCheck($card)) {
         return ['ok' => false, 'reason' => 'Invalid card number'];
     }
@@ -132,7 +120,7 @@ function parseCard(string $cc): array {
         'ok'    => true,
         'card'  => $card,
         'month' => $month,
-        'year'  => $year, // her zaman 2 hane
+        'year'  => $year,
         'cvv'   => $cvv,
         'raw'   => "$card|$month|$year|$cvv",
     ];
@@ -197,26 +185,79 @@ function buildResponse(string $gateway, array $check, array $GATEWAYS): array {
     ];
 }
 
+/**
+ * URL'den gateway + cc çıkar.
+ * Kabul edilen formatlar:
+ *   /?maxipuan?cc=KART|AY|YIL|CVV
+ *   /?stripeauth?cc=...
+ *   /?bonuspuan?cc=...
+ *   /?1charge?cc=...
+ * Ayrıca klasik ?gateway=maxipuan&cc=... da desteklenir.
+ */
+function parseRequest(array $GATEWAYS): array {
+    $uri    = $_SERVER['REQUEST_URI'] ?? '/';
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+    // POST desteği
+    $postGateway = $_POST['gateway'] ?? null;
+    $postCc      = $_POST['cc'] ?? null;
+
+    // Query string'i al (?maxipuan?cc=... veya ?gateway=maxipuan&cc=...)
+    $query = parse_url($uri, PHP_URL_QUERY) ?? '';
+
+    // Özel durum: ?maxipuan?cc=KART... → query string'de iki adet '?' var
+    // parse_url ilk ?'den sonrasını verir: "maxipuan?cc=KART..."
+    // Bu yüzden manuel parse ediyoruz.
+    $gateway = null;
+    $cc      = null;
+
+    if ($query !== '') {
+        // "maxipuan?cc=..." veya "stripeauth?cc=..." formatı
+        if (strpos($query, '?cc=') !== false) {
+            [$gwPart, $ccPart] = explode('?cc=', $query, 2);
+            $gateway = trim($gwPart);
+            $cc      = urldecode($ccPart);
+        }
+        // "gateway=maxipuan&cc=..." formatı
+        elseif (strpos($query, '=') !== false) {
+            parse_str($query, $q);
+            $gateway = $q['gateway'] ?? null;
+            $cc      = $q['cc'] ?? null;
+        }
+        // Sadece gateway adı: "?maxipuan"
+        else {
+            $gateway = trim($query);
+            $cc      = $_GET['cc'] ?? null;
+        }
+    }
+
+    // POST override
+    if ($postGateway !== null) $gateway = $postGateway;
+    if ($postCc !== null)      $cc      = $postCc;
+
+    // Fallback: normal $_GET
+    if ($gateway === null) $gateway = $_GET['gateway'] ?? null;
+    if ($cc === null)      $cc      = $_GET['cc'] ?? null;
+
+    $gateway = $gateway !== null ? strtolower(trim($gateway)) : null;
+
+    return [$gateway, $cc, $method];
+}
+
 // ------------------------------------------------------------
-// 4) ROUTER
+// 3) ROUTER
 // ------------------------------------------------------------
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+[$gateway, $cc, $method] = parseRequest($GATEWAYS);
+
 if (!in_array($method, ['GET', 'POST'], true)) {
     jsonOut(405, ['durum' => '405', 'message' => 'Method Not Allowed']);
 }
 
-$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
-$path = rtrim($path, '/');
-if ($path === '') $path = '/';
-
-if (!isset($ROUTES[$path])) {
+if ($gateway === null || !isset($GATEWAYS[$gateway])) {
     jsonOut(404, ['durum' => '404', 'message' => 'Endpoint not found']);
 }
 
-$gateway = $ROUTES[$path];
-
-$cc = $_GET['cc'] ?? $_POST['cc'] ?? '';
-if ($cc === '') {
+if ($cc === null || $cc === '') {
     jsonOut(400, ['durum' => '400', 'message' => 'Missing cc parameter']);
 }
 
