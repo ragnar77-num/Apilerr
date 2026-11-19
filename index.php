@@ -1,11 +1,13 @@
 <?php
 /* ============================================================
- *  CC CHECKER API — Single File — v2.2
+ *  CC CHECKER API — Single File — v2.3
+ *  - Prefix: 0,1,2,3,7,8 → Invalid format
+ *            4,5,6,9     → Normal işlem
  *  - Yıl: 28 veya 2028 kabul
- *  - Prefix kuralı:
- *      0,1,2,3,7,8 → direkt "Invalid format"
- *      4,5,6,9     → normal işlem (Luhn + expiry + response)
- *  - CVV: 000 dahil 3-4 hane kabul
+ *  - Tutar dağılımı:
+ *      %70 → 0.00  - 100.00
+ *      %25 → 100.00 - 1000.00
+ *      %5  → 1000.00 - 3560.00
  * ============================================================ */
 
 header('Content-Type: application/json; charset=utf-8');
@@ -117,11 +119,6 @@ function detectBrand(string $card): string {
     return 'Unknown';
 }
 
-/**
- * Prefix kontrolü:
- *   4, 5, 6, 9 → true (işleme alınır)
- *   0, 1, 2, 3, 7, 8 → false (direkt Invalid format)
- */
 function isValidPrefix(string $card): bool {
     return in_array($card[0], ['4', '5', '6', '9'], true);
 }
@@ -137,31 +134,27 @@ function parseCard(string $cc): array {
 
     [$card, $month, $year, $cvv] = array_map('trim', $parts);
 
-    // Kart numarası: 16 hane
     if (!preg_match('/^\d{16}$/', $card)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
     // === PREFIX KURALI ===
-    // 0,1,2,3,7,8 → direkt Invalid format (Luhn/expiry kontrolü YOK)
     if (!isValidPrefix($card)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // === 4,5,6,9 İÇİN NORMAL KONTROLLER ===
-
-    // Ay: 01-12
+    // Ay
     if (!preg_match('/^(0[1-9]|1[0-2])$/', $month)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // Yıl: 28 / 2028 / 8
+    // Yıl
     $yearNorm = normalizeYear($year);
     if ($yearNorm === null) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
 
-    // CVV: 3-4 hane (000 dahil)
+    // CVV
     if (!preg_match('/^\d{3,4}$/', $cvv)) {
         return ['ok' => false, 'reason' => 'Invalid format'];
     }
@@ -196,23 +189,37 @@ function isApproved(string $card, string $gateway): bool {
     return (cardHash($card, $gateway) % 100) < 15; // %15
 }
 
+/**
+ * Tutar dağılımı:
+ *   %70 → 0.00  - 100.00
+ *   %25 → 100.00 - 1000.00
+ *   %5  → 1000.00 - 3560.00
+ */
 function generateAmount(string $card, string $gateway, float $min, float $max): string {
-    $h = cardHash($card, $gateway . '_amt');
-    $r = $h % 10000;
+    $h = cardHash($card, $gateway . '_amt') % 10000; // 0-9999
+    $roll = $h % 100; // 0-99 → yüzde dilimi
 
-    if ($r < 3000) {
-        $val = $min + ($r / 3000) * 50.00;
-    } elseif ($r < 6000) {
-        $val = 50.00 + (($r - 3000) / 3000) * 450.00;
-    } elseif ($r < 8500) {
-        $val = 500.00 + (($r - 6000) / 2500) * 1000.00;
+    if ($roll < 70) {
+        // %70 → 0.00 - 100.00
+        $rangeMin = 0.00;
+        $rangeMax = 100.00;
+    } elseif ($roll < 95) {
+        // %25 → 100.00 - 1000.00
+        $rangeMin = 100.00;
+        $rangeMax = 1000.00;
     } else {
-        $val = 1500.00 + (($r - 8500) / 1500) * 2060.00;
+        // %5 → 1000.00 - 3560.00
+        $rangeMin = 1000.00;
+        $rangeMax = 3560.00;
     }
 
+    // Aralık içi rastgele değer (deterministik)
+    $subRoll = ($h * 7919) % 10000; // 0-9999
+    $val = $rangeMin + (($rangeMax - $rangeMin) * $subRoll / 9999);
+
+    // Clamp
     if ($val > $max) $val = $max;
     if ($val < $min) $val = $min;
-    if ($r % 100 < 10) $val = 0.00;
 
     return number_format($val, 2, '.', '');
 }
@@ -306,7 +313,7 @@ if ($gateway === 'list') {
 }
 
 if ($gateway === 'health') {
-    jsonOut(200, ['durum' => '200', 'status' => 'ok', 'time' => date('c'), 'version' => '2.2']);
+    jsonOut(200, ['durum' => '200', 'status' => 'ok', 'time' => date('c'), 'version' => '2.3']);
 }
 
 if ($gateway === null || (!isset($GATEWAYS[$gateway]) && $gateway !== 'random')) {
